@@ -1,91 +1,121 @@
 import time
 import sys
+import random
 from playwright.sync_api import sync_playwright
 from utils.telegram import send_telegram_message
 
-COURSE_URL = "https://portalex.technion.ac.il/sap/bc/ui5_ui5/ui2/ushell/shells/abap/FioriLaunchpad.html?sap-client=700&sap-ushell-config=headerless&sap-language=he&appState=lean#AcademicCourse-display"
-REGISTERED_THRESHOLD_MAIN = 58
-REGISTERED_THRESHOLD = 57
+class CourseRegistrationBot:
+    COURSE_URL = "https://portalex.technion.ac.il/sap/bc/ui5_ui5/ui2/ushell/shells/abap/FioriLaunchpad.html?sap-client=700&sap-ushell-config=headerless&sap-language=he&appState=lean#AcademicCourse-display"
+    TIMEOUT = 70000
 
-def get_available_group_id(page):
-    registered_elements = page.locator("text='רישום נשמר'")
-    for i in range(registered_elements.count()):
-        element = registered_elements.nth(i)
-        registered_text = element.locator("xpath=./following-sibling::*[2]").inner_text()
-        registered_cnt = int(registered_text)
+    def __init__(self, course_id):
+        self.course_id = course_id
+        self.page = None
 
-        if i == 0 and registered_cnt < REGISTERED_THRESHOLD_MAIN:
-            return 0
-        if registered_cnt < REGISTERED_THRESHOLD:
-            return i
-    return 0
+    def get_available_group_id(self):
+        registered_elements = self.page.locator("text='רישום נשמר'")
+        max_registration_elements = self.page.locator("text='מקסימום מקומות'")
+        
+        for i in range(registered_elements.count()):
+            r_element = registered_elements.nth(i)
+            registered_text = r_element.locator("xpath=./following-sibling::*[2]").inner_text()
+            registered_cnt = int(registered_text)
 
-def connect_to_existing_browser(course_id):
-    """
-    Connects to an existing Chrome session and checks for course availability by refreshing the page.
-    Sends a Telegram notification when a course becomes available.
-    """
-    with sync_playwright() as p:
-        # Connect to the existing Chrome session using the remote debugging protocol
-        browser = p.chromium.connect_over_cdp("http://localhost:9222")
-        context = browser.contexts[0]  # Access the first browser context
-        page = context.new_page()
+            max_element = max_registration_elements.nth(i)
+            max_text = max_element.locator("xpath=./following-sibling::*[2]").inner_text()
+            max_cnt = int(max_text)
 
-        # Load SAP
-        page.goto(COURSE_URL)
-        page.reload()
-        page.wait_for_load_state("networkidle")
-        page.wait_for_timeout(2000)
-        page.click("text='פריטים שנבחרו'")
+            if registered_cnt < max_cnt:
+                return i
+        return None
 
-        # Keep refreshing until the course is available
-        while True:
-            print("Checking course availability...")
+    def connect_and_setup(self, playwright):
+        """Connects to an existing Chrome session and sets up the page."""
+        browser = playwright.chromium.connect_over_cdp("http://localhost:9222")
+        context = browser.contexts[0]
+        self.page = context.new_page()
+        self.load_catalog()
 
-            # Pick Course
+    def load_catalog(self):
+        """Loads the initial catalog page."""
+        self.page.goto(self.COURSE_URL)
+        self.page.reload()
+        self.page.wait_for_load_state("networkidle")
+        self.page.wait_for_timeout(1000)
+        self.page.click("text='פריטים שנבחרו'")
+
+    def click_course(self):
+        """Locates the course and clicks the registration button."""
+        print("Checking course availability...")
+        try:
+            course_id_element = self.page.get_by_text(self.course_id)
+            container = course_id_element.locator('xpath=../../../../../..')
+            button = container.locator("button:has(bdi:text-is('הרשם למקצוע'))")
+            button.click()
+            return True
+        except Exception as e:
+            print(f"Error finding course button: {e}")
+            return False
+
+    def order_course(self):
+        """Selects a group and clicks order."""
+        try:
+            self.page.wait_for_selector("#__button32-eventPackagesSelectionDialogList-0", state='visible', timeout=self.TIMEOUT)
+            group_id = self.get_available_group_id()
+            
+            if group_id is None:
+                print("No spots available in any group. Canceling...")
+                self.page.click("text='בטל'")
+                return False
+            
+            print(f"Available group id: {group_id}")
+            self.page.click(f'#__button32-eventPackagesSelectionDialogList-{group_id}')
+            self.page.click("text='הזמן'")
+            return True
+        except Exception as e:
+            print(f"Error selecting group: {e}")
+            return False
+
+    def handle_result(self):
+        """Checks for registration success or error."""
+        selector = "text='שגיאה'"
+        self.page.wait_for_selector(selector, state='visible', timeout=self.TIMEOUT)
+        full_element = self.page.locator(selector)
+
+        if full_element.count() > 0:
+            print("Course is full")
             try:
-                course_id_element = page.locator(f"text='מק-{course_id}'")
-                container = course_id_element.locator('xpath=../../../../../..')
-                button = container.locator("button:has(bdi:text-is('הרשם למקצוע'))")
-                button.click()
+                self.page.wait_for_selector("text='סגור'", state='visible', timeout=self.TIMEOUT)
+                time.sleep(0.5)
+                self.page.click("text='סגור'", timeout=self.TIMEOUT)
+                time.sleep(1)
             except Exception as e:
-                print(f"Error finding course button: {e}")
-                continue
+                print(f"Error closing error message: {e}")
+            return False
+        else:
+            send_telegram_message("Registered Successfully!")
+            print("Registered successfully!")
+            return True
 
-            # Pick Group & Register
-            try:
-                page.wait_for_selector("#__button23-eventPackagesSelectionDialogList-0", state='visible', timeout=10000)
-                group_id = get_available_group_id(page)
-                page.click(f'#__button23-eventPackagesSelectionDialogList-{group_id}')
-                page.click("text='הזמן'")
-                page.wait_for_timeout(250)
-            except Exception as e:
-                print(f"Error selecting group: {e}")
-                continue
-
-            # Check Registration Status
-            selector = "text='שגיאה'"
-            page.wait_for_selector(selector, state='visible', timeout=5000)
-            full_element = page.locator(selector)
-
-            if full_element.count() > 0:
-                print("Course is full")
-                try:
-                    # Close error message
-                    page.wait_for_selector("text='סגור'", state='visible', timeout=5000)
-                    time.sleep(0.5)
-                    page.click("text='סגור'", timeout=5000)
-                    time.sleep(1)
-                except Exception as e:
-                    print(f"Error closing error message: {e}")
-            else:
-                send_telegram_message("Registered Successfully!")
-                print("Registered successfully!")
-                sys.exit(0)
+    def run(self):
+        """Main registration loop."""
+        with sync_playwright() as p:
+            self.connect_and_setup(p)
+            while True:
+                time.sleep(random.randint(0, 70) / 1000.0)
+                if not self.click_course():
+                    continue
+                
+                if not self.order_course():
+                    continue
+                
+                if self.handle_result():
+                    break
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
         print("Usage: python main.py <course_id>")
         sys.exit(1)
 
-    connect_to_existing_browser(sys.argv[1])
+    bot = CourseRegistrationBot(sys.argv[1])
+    bot.run()
